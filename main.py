@@ -42,7 +42,7 @@ class Weebo:
         # setup espeak for phoneme generation
         espeak_data_path = espeakng_loader.get_data_path()
         espeak_lib_path = espeakng_loader.get_library_path()
-        EspeakWrapper.set_data_path(espeak_data_path)
+        EspeakWrapper.data_path = espeak_data_path
         EspeakWrapper.set_library(espeak_lib_path)
 
         # vocab for phoneme tokenization
