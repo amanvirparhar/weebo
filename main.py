@@ -12,15 +12,30 @@ from ollama import chat
 from lightning_whisper_mlx import LightningWhisperMLX
 import signal
 from threading import Event
+import torch
+from scipy.signal import resample
 
+BAD_SENTENCES = [
+    "I",
+    "you",
+    "You're",
+    "THANK YOU",
+    "www.microsoft.com",
+    "The",
+    "BANG",
+    "Silence.",
+    "Sous-titrage Société Radio-Canada",
+    "Sous",
+    "Sous-",
+]
 
 class Weebo:
     def __init__(self):
         # audio settings
         self.SAMPLE_RATE = 24000
         self.WHISPER_SAMPLE_RATE = 16000
-        self.SILENCE_THRESHOLD = 0.02   # volume level that counts as silence
-        self.SILENCE_DURATION = 1.5    # seconds of silence before cutting recording
+        self.AUDIO_CHUNK_DURATION = 1.0  # Analyze 1-second chunks
+        self.AUDIO_CHUNK_SIZE = int(self.SAMPLE_RATE * self.AUDIO_CHUNK_DURATION)
 
         # text-to-speech settings
         self.MAX_PHONEME_LENGTH = 510
@@ -72,6 +87,10 @@ class Weebo:
         # init speech recognition model
         self.whisper_mlx = LightningWhisperMLX(model="small", batch_size=12)
 
+        # init silero VAD model
+        self.vad_model, self.utils = torch.hub.load(repo_or_dir='snakers4/silero-vad', model='silero_vad', force_reload=False)
+        self.get_speech_timestamps, self.save_audio, self.read_audio, self.VAD_iterator, self.collect_chunks = self.utils
+
     def _create_vocab(self) -> Dict[str, int]:
         # create mapping of characters/phonemes to integer tokens
         chars = ['$'] + list(';:,.!?¡¿—…"«»"" ') + \
@@ -112,55 +131,68 @@ class Weebo:
         return audio
 
     def record_and_transcribe(self):
-        # state for audio recording
         audio_buffer = []
-        silence_frames = 0
-        total_frames = 0
+        accumulated_audio = []
+        is_speaking = False
 
         def callback(indata, frames, time_info, status):
-            # callback function that processes incoming audio frames
             if self.shutdown_event.is_set():
                 raise sd.CallbackStop()
 
-            nonlocal audio_buffer, silence_frames, total_frames
+            nonlocal audio_buffer, accumulated_audio, is_speaking
 
             if status:
                 print(status)
 
             audio = indata.flatten()
-            level = np.abs(audio).mean()
-
             audio_buffer.extend(audio.tolist())
-            total_frames += len(audio)
 
-            # track silence duration
-            if level < self.SILENCE_THRESHOLD:
-                silence_frames += len(audio)
-            else:
-                silence_frames = 0
+            # Process audio in chunks
+            if len(audio_buffer) >= self.AUDIO_CHUNK_SIZE:
+                audio_chunk = np.array(audio_buffer[:self.AUDIO_CHUNK_SIZE], dtype=np.float32)
+                audio_buffer = audio_buffer[self.AUDIO_CHUNK_SIZE:]  # Remove processed chunk from buffer
 
-            # process audio when silence is detected
-            if silence_frames > self.SILENCE_DURATION * self.SAMPLE_RATE:
-                audio_segment = np.array(audio_buffer, dtype=np.float32)
+                # Resample to 16 kHz (required by Silero VAD)
+                audio_chunk_resampled = resample(audio_chunk, int(self.WHISPER_SAMPLE_RATE * self.AUDIO_CHUNK_DURATION))
 
-                if len(audio_segment) > self.SAMPLE_RATE:
-                    text = self.whisper_mlx.transcribe(audio_segment)['text']
+                # Check for voice activity
+                speech_timestamps = self.get_speech_timestamps(audio_chunk_resampled, self.vad_model, sampling_rate=self.WHISPER_SAMPLE_RATE)
 
-                    # skip empty/invalid transcriptions
-                    if text.strip():
-                        print(f"Transcription: {text}")
-                        self.messages.append({
-                            'role': 'user',
-                            'content': text
-                        })
-                        self.create_and_play_response(text)
+                if speech_timestamps:
+                    if not is_speaking:
+                        print("Voice detected, starting transcription...")
+                        is_speaking = True
 
-                # reset state
-                audio_buffer.clear()
-                silence_frames = 0
-                total_frames = 0
+                    # Accumulate audio during speech detection
+                    accumulated_audio.extend(audio_chunk_resampled.tolist())
+                else:
+                    if is_speaking:
+                        print("Silence detected, transcribing...")
+                        is_speaking = False
 
-        # start recording loop
+                        # Transcribe accumulated audio
+                        if accumulated_audio:
+                            accumulated_audio_np = np.array(accumulated_audio, dtype=np.float32)
+                            text = self.whisper_mlx.transcribe(accumulated_audio_np)['text']
+
+                            # Validate transcription
+                            if text.strip():
+                                if text.strip() in BAD_SENTENCES:
+                                    print('Hallucination detected. Skipping.')
+                                elif not re.fullmatch(r"[A-Za-z\s.,!?\'\"-:;()]*", text):
+                                    print('Non-english characters detected. Skipping.', text)
+                                else:
+                                    print(f"Transcription: {text}")
+                                    self.messages.append({
+                                        'role': 'user',
+                                        'content': text
+                                    })
+                                    self.create_and_play_response(text)
+
+                            # Clear accumulated audio buffer
+                            accumulated_audio.clear()
+
+        # Start audio recording loop
         try:
             with sd.InputStream(
                 callback=callback,
